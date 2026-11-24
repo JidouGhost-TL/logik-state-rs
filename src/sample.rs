@@ -24,7 +24,7 @@ pub const GBAMOD2_MAGIC: &[u8; 8] = b"GBAMOD2.";
 pub const GBAMOD30_MAGIC: &[u8; 8] = b"GBAMOD30";
 
 /// Parsed `GBAMOD1.` / `GBAMOD2.` / `GBAMOD30` song module header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogikModHeader {
     /// Module format magic (`"GBAMOD1."`, `"GBAMOD2."`, or `"GBAMOD30"`).
     pub magic: [u8; 8],
@@ -82,7 +82,7 @@ impl LogikModHeader {
 }
 
 /// 20-byte Logik State GBAModPlay v2.x / early v3.0 sample descriptor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogikSampleDescV2 {
     /// Byte offset relative to the sample bank's packed payload base.
     pub data_offset: u32,
@@ -137,7 +137,7 @@ impl LogikSampleDescV2 {
 }
 
 /// 24-byte Logik State GBAModPlay v3.0b / v3.1 sample descriptor with explicit sample rate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogikSampleDescV3 {
     /// Byte offset relative to the sample bank's packed payload base.
     pub data_offset: u32,
@@ -185,7 +185,7 @@ impl LogikSampleDescV3 {
 }
 
 /// Zero-allocation borrowed view of a Logik State GBAModPlay PCM8 sample.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogikSampleView<'a> {
     /// Sample bank descriptor format (`V2Desc20` or `V3Desc24`).
     pub bank_format: LogikBankFormat,
@@ -302,13 +302,31 @@ impl<'a> LogikSampleView<'a> {
     #[inline]
     #[must_use]
     pub const fn is_looped(&self) -> bool {
-        self.loop_start.is_some() && self.loop_end.is_some()
+        self.loop_len() > 0
+    }
+
+    /// Loop length in samples (`0` for one-shot samples).
+    #[inline]
+    #[must_use]
+    pub const fn loop_len(&self) -> usize {
+        match (self.loop_start, self.loop_end) {
+            (Some(ls), Some(le)) => {
+                let ls = ls as usize;
+                let le = if (le as usize) < self.pcm_bytes.len() {
+                    le as usize
+                } else {
+                    self.pcm_bytes.len()
+                };
+                le.saturating_sub(ls)
+            }
+            _ => 0,
+        }
     }
 }
 
 /// Owned Logik State GBAModPlay decoded PCM8 sample (requires `alloc`).
 #[cfg(feature = "alloc")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogikSample {
     /// Sample bank descriptor format (`V2Desc20` or `V3Desc24`).
     pub bank_format: LogikBankFormat,

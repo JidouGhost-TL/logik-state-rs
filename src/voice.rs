@@ -9,7 +9,7 @@
 /// - **v3.0+ Q20.12 fixed-point voices** ([`crate::LogikVersion::V3EarlyVol64`],
 ///   [`crate::LogikVersion::V3EarlyVol64Adpcm`], [`crate::LogikVersion::V3Standard`]), where
 ///   `length` and `loop_len` are in Q20.12 fixed-point (`samples << 12`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogikPcmVoice {
     /// Current base byte offset into the PCM8 sample buffer (`r3`).
     pub ptr_offset: usize,
@@ -88,7 +88,7 @@ impl LogikPcmVoice {
 
 /// Hardware 4-bit IMA ADPCM voice state matching the `V3EarlyVol64Adpcm` ARM7TDMI mixer
 /// (*Super Puzzle Fighter II*, `AZ8E` / `AZ8P`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogikAdpcmVoice {
     /// Remaining ADPCM nibbles to decode (`[r0, #0x0C]`; each nibble produces 2 output samples).
     pub remaining_nibbles: u32,

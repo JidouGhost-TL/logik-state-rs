@@ -7,16 +7,162 @@
 //! - [`StudioSynth`]: 48,000 Hz `f32` band-limited Lanczos-3 polyphase windowed-sinc renderer
 //!   (with general Lanczos-`a` fallback) and true equal-power stereo panning.
 
-use crate::freq::{IMA_INDEX_TABLE, IMA_STEP_TABLE};
+use crate::freq::IMA_STEP_TABLE;
 use crate::sample::LogikSampleView;
 use crate::version::LogikVersion;
 use crate::voice::{LogikAdpcmVoice, LogikPcmVoice};
+
+/// Compile-time 89 × 16 signed predictor-delta LUT for Logik State `V3EarlyVol64Adpcm`:
+/// `±(((nib & 7) * IMA_STEP_TABLE[idx]) >> 2)`.
+///
+/// Keeping `step_idx` updated via register arithmetic (`ima_index_delta` + `clamp(0, 88)`)
+/// breaks the L1 load-to-use latency chain on `step_idx`, while this table removes the
+/// per-nibble multiply, shift, and sign branch.
+const fn build_ima_signed_diff_lut() -> [[i32; 16]; 89] {
+    let mut table = [[0i32; 16]; 89];
+    let mut idx = 0usize;
+    while idx < 89 {
+        let step = IMA_STEP_TABLE[idx];
+        let mut nib = 0usize;
+        while nib < 16 {
+            let diff = ((((nib & 7) as i32) * step) as u32 >> 2) as i32;
+            table[idx][nib] = if (nib & 8) != 0 { -diff } else { diff };
+            nib += 1;
+        }
+        idx += 1;
+    }
+    table
+}
+
+static IMA_SIGNED_DIFF_LUT: [[i32; 16]; 89] = build_ima_signed_diff_lut();
+
+#[inline(always)]
+const fn ima_index_delta(nib: u8) -> i32 {
+    let mag = (nib & 7) as i32;
+    if mag < 4 {
+        -1
+    } else {
+        (mag - 3) << 1
+    }
+}
+
+/// Fast interior-run PCM8 mixer kernel (no loop wrap, no out-of-bounds).
+///
+/// Caller must guarantee that for all `k` in `0..dst.len()`:
+/// - `(phase0 as u64) + (k as u64) * (step as u64) < (1u64 << 32)` (and `< (1u64 << 31)` when
+///   signed shift semantics apply), and
+/// - `(((phase0 as u64) + (k as u64) * (step as u64)) >> 12) < src.len()`.
+#[inline(always)]
+fn mix_pcm_interior_run<const VOL64: bool>(
+    src: &[u8],
+    dst: &mut [i8],
+    phase0: u32,
+    step: u32,
+    vol: i32,
+) {
+    if step == 0x1000 {
+        let start = (phase0 >> 12) as usize;
+        let s_slice = &src[start..start + dst.len()];
+        if VOL64 {
+            for (&b, d) in s_slice.iter().zip(dst.iter_mut()) {
+                *d = d.wrapping_add((b as i8) >> 2);
+            }
+        } else if (0..=255).contains(&vol) {
+            let v16 = vol as i16;
+            for (&b, d) in s_slice.iter().zip(dst.iter_mut()) {
+                let s = b as i8 as i16;
+                *d = d.wrapping_add(((s * v16) >> 8) as i8);
+            }
+        } else {
+            for (&b, d) in s_slice.iter().zip(dst.iter_mut()) {
+                let s = b as i8 as i32;
+                *d = d.wrapping_add((s.wrapping_mul(vol) >> 8) as i8);
+            }
+        }
+        return;
+    }
+
+    let mut ph = phase0;
+    let step2 = step.wrapping_mul(2);
+    let step3 = step.wrapping_mul(3);
+    let step4 = step.wrapping_mul(4);
+    let step5 = step.wrapping_mul(5);
+    let step6 = step.wrapping_mul(6);
+    let step7 = step.wrapping_mul(7);
+    let step8 = step.wrapping_mul(8);
+
+    let (chunks, remainder) = dst.as_chunks_mut::<8>();
+    if VOL64 {
+        for chunk in chunks {
+            let s = [
+                src[(ph >> 12) as usize] as i8,
+                src[(ph.wrapping_add(step) >> 12) as usize] as i8,
+                src[(ph.wrapping_add(step2) >> 12) as usize] as i8,
+                src[(ph.wrapping_add(step3) >> 12) as usize] as i8,
+                src[(ph.wrapping_add(step4) >> 12) as usize] as i8,
+                src[(ph.wrapping_add(step5) >> 12) as usize] as i8,
+                src[(ph.wrapping_add(step6) >> 12) as usize] as i8,
+                src[(ph.wrapping_add(step7) >> 12) as usize] as i8,
+            ];
+            ph = ph.wrapping_add(step8);
+            for j in 0..8 {
+                chunk[j] = chunk[j].wrapping_add(s[j] >> 2);
+            }
+        }
+    } else if (0..=255).contains(&vol) {
+        let v16 = vol as i16;
+        for chunk in chunks {
+            let s = [
+                src[(ph >> 12) as usize] as i8 as i16,
+                src[(ph.wrapping_add(step) >> 12) as usize] as i8 as i16,
+                src[(ph.wrapping_add(step2) >> 12) as usize] as i8 as i16,
+                src[(ph.wrapping_add(step3) >> 12) as usize] as i8 as i16,
+                src[(ph.wrapping_add(step4) >> 12) as usize] as i8 as i16,
+                src[(ph.wrapping_add(step5) >> 12) as usize] as i8 as i16,
+                src[(ph.wrapping_add(step6) >> 12) as usize] as i8 as i16,
+                src[(ph.wrapping_add(step7) >> 12) as usize] as i8 as i16,
+            ];
+            ph = ph.wrapping_add(step8);
+            for j in 0..8 {
+                chunk[j] = chunk[j].wrapping_add(((s[j] * v16) >> 8) as i8);
+            }
+        }
+    } else {
+        for chunk in chunks {
+            let s = [
+                src[(ph >> 12) as usize] as i8 as i32,
+                src[(ph.wrapping_add(step) >> 12) as usize] as i8 as i32,
+                src[(ph.wrapping_add(step2) >> 12) as usize] as i8 as i32,
+                src[(ph.wrapping_add(step3) >> 12) as usize] as i8 as i32,
+                src[(ph.wrapping_add(step4) >> 12) as usize] as i8 as i32,
+                src[(ph.wrapping_add(step5) >> 12) as usize] as i8 as i32,
+                src[(ph.wrapping_add(step6) >> 12) as usize] as i8 as i32,
+                src[(ph.wrapping_add(step7) >> 12) as usize] as i8 as i32,
+            ];
+            ph = ph.wrapping_add(step8);
+            for j in 0..8 {
+                chunk[j] = chunk[j].wrapping_add((s[j].wrapping_mul(vol) >> 8) as i8);
+            }
+        }
+    }
+
+    for d in remainder {
+        let s = src[(ph >> 12) as usize] as i8 as i32;
+        ph = ph.wrapping_add(step);
+        let scaled = if VOL64 {
+            s >> 2
+        } else {
+            s.wrapping_mul(vol) >> 8
+        };
+        *d = d.wrapping_add(scaled as i8);
+    }
+}
 
 /// Bit-exact software emulation of all **6** Logik State GBAModPlay ARM7TDMI mixer revisions.
 ///
 /// Every mixing kernel in `AccuracySynth` is verified strictly byte-for-byte (`assert_eq!`,
 /// zero tolerance) against real ARM7TDMI execution captured in headless `libmgba.so.0.10`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccuracySynth;
 
 impl AccuracySynth {
@@ -41,8 +187,29 @@ impl AccuracySynth {
         let r0 = voice.loop_len & 0xFFFF;
         let vol = voice.volume as i32;
         let pcm_len = pcm_bytes.len();
+        let out_len = out.len();
+        let mut offset = 0usize;
 
-        for dst in out.iter_mut() {
+        while offset < out_len {
+            if step > 0 && sl > 0 && ptr < pcm_len {
+                let safe_samples = (sl as usize).min(pcm_len - ptr);
+                let limit_phase = ((safe_samples as u64) << 12).min(0x1_0000_0000u64);
+                if (phase as u64) < limit_phase {
+                    let k_max = (limit_phase - 1 - (phase as u64)) / (step as u64);
+                    let run = ((k_max + 1) as usize).min(out_len - offset);
+                    mix_pcm_interior_run::<false>(
+                        &pcm_bytes[ptr..pcm_len],
+                        &mut out[offset..offset + run],
+                        phase,
+                        step,
+                        vol,
+                    );
+                    phase = phase.wrapping_add(step.wrapping_mul(run as u32));
+                    offset += run;
+                    continue;
+                }
+            }
+
             let mut r6 = phase >> 12;
             if (r6 as i32) >= (sl as i32) {
                 ptr = ptr.wrapping_add(ip as usize);
@@ -59,7 +226,8 @@ impl AccuracySynth {
             }
             let s = pcm_bytes[idx] as i8 as i32;
             let prod = s.wrapping_mul(vol);
-            *dst = dst.wrapping_add(((prod as u32) >> 8) as i8);
+            out[offset] = out[offset].wrapping_add(((prod as u32) >> 8) as i8);
+            offset += 1;
         }
 
         voice.ptr_offset = ptr;
@@ -71,7 +239,7 @@ impl AccuracySynth {
     /// Shared implementation for **GBAModPlay v2.x** integer-length mixers
     /// ([`LogikVersion::V2Mod2Halfword`] and [`LogikVersion::V2Mod2Word`]).
     #[inline(always)]
-    fn mix_v2_impl<const HALFWORD: bool>(
+    fn mix_v2_impl<const HALFWORD: bool, const VOL64: bool>(
         pcm_bytes: &[u8],
         voice: &mut LogikPcmVoice,
         out: &mut [i8],
@@ -103,10 +271,35 @@ impl AccuracySynth {
             voice.loop_len
         };
         let vol = voice.volume as i32;
-        let vol64 = voice.volume == 0x40;
         let pcm_len = pcm_bytes.len();
+        let out_len = out.len();
+        let mut offset = 0usize;
 
-        for dst in out.iter_mut() {
+        while offset < out_len {
+            if step > 0
+                && (step as i32) > 0
+                && (phase as i32) >= 0
+                && (sl as i32) > 0
+                && ptr < pcm_len
+            {
+                let safe_samples = (sl as usize).min(pcm_len - ptr);
+                let limit_phase = ((safe_samples as u64) << 12).min(0x8000_0000u64);
+                if (phase as u64) < limit_phase {
+                    let k_max = (limit_phase - 1 - (phase as u64)) / (step as u64);
+                    let run = ((k_max + 1) as usize).min(out_len - offset);
+                    mix_pcm_interior_run::<VOL64>(
+                        &pcm_bytes[ptr..pcm_len],
+                        &mut out[offset..offset + run],
+                        phase,
+                        step,
+                        vol,
+                    );
+                    phase = phase.wrapping_add(step.wrapping_mul(run as u32));
+                    offset += run;
+                    continue;
+                }
+            }
+
             let mut r6 = (phase as i32) >> 12;
             if r6 >= (sl as i32) {
                 ptr = ptr.wrapping_add(ip as usize);
@@ -122,12 +315,13 @@ impl AccuracySynth {
                 break;
             }
             let s = pcm_bytes[idx] as i8 as i32;
-            let scaled = if vol64 {
+            let scaled = if VOL64 {
                 s >> 2
             } else {
                 s.wrapping_mul(vol) >> 8
             };
-            *dst = dst.wrapping_add(scaled as i8);
+            out[offset] = out[offset].wrapping_add(scaled as i8);
+            offset += 1;
         }
 
         voice.ptr_offset = ptr;
@@ -140,14 +334,22 @@ impl AccuracySynth {
     /// PCM8 voice into an 8-bit DirectSound mixing buffer.
     #[inline]
     pub fn mix_v2_halfword(pcm_bytes: &[u8], voice: &mut LogikPcmVoice, out: &mut [i8]) {
-        Self::mix_v2_impl::<true>(pcm_bytes, voice, out);
+        if voice.volume == 0x40 {
+            Self::mix_v2_impl::<true, true>(pcm_bytes, voice, out);
+        } else {
+            Self::mix_v2_impl::<true, false>(pcm_bytes, voice, out);
+        }
     }
 
     /// Mix a **GBAModPlay v2.x word** ([`LogikVersion::V2Mod2Word`], *Zapper*) PCM8 voice
     /// into an 8-bit DirectSound mixing buffer.
     #[inline]
     pub fn mix_v2_word(pcm_bytes: &[u8], voice: &mut LogikPcmVoice, out: &mut [i8]) {
-        Self::mix_v2_impl::<false>(pcm_bytes, voice, out);
+        if voice.volume == 0x40 {
+            Self::mix_v2_impl::<false, true>(pcm_bytes, voice, out);
+        } else {
+            Self::mix_v2_impl::<false, false>(pcm_bytes, voice, out);
+        }
     }
 
     /// Mix a **GBAModPlay early v3.0** ([`LogikVersion::V3EarlyVol64`] /
@@ -178,8 +380,34 @@ impl AccuracySynth {
         let mut ip = voice.loop_start;
         let r0 = voice.loop_len;
         let pcm_len = pcm_bytes.len();
+        let out_len = out.len();
+        let mut offset = 0usize;
 
-        for dst in out.iter_mut() {
+        while offset < out_len {
+            if step > 0
+                && (step as i32) > 0
+                && (phase as i32) >= 0
+                && (sl as i32) > 0
+                && ptr < pcm_len
+            {
+                let safe_pcm = ((pcm_len - ptr) as u64).saturating_mul(0x1000);
+                let limit_phase = (sl as u64).min(safe_pcm);
+                if (phase as u64) < limit_phase {
+                    let k_max = (limit_phase - 1 - (phase as u64)) / (step as u64);
+                    let run = ((k_max + 1) as usize).min(out_len - offset);
+                    mix_pcm_interior_run::<true>(
+                        &pcm_bytes[ptr..pcm_len],
+                        &mut out[offset..offset + run],
+                        phase,
+                        step,
+                        0x40,
+                    );
+                    phase = phase.wrapping_add(step.wrapping_mul(run as u32));
+                    offset += run;
+                    continue;
+                }
+            }
+
             // Exact ARM7TDMI order in `vol == 0x40` fast path:
             //   +0x0C0: asr r6, r4, #0xc
             //   +0x0C4: cmp r4, sl
@@ -202,7 +430,8 @@ impl AccuracySynth {
                 break;
             }
             let s = pcm_bytes[idx] as i8 as i32;
-            *dst = dst.wrapping_add((s >> 2) as i8);
+            out[offset] = out[offset].wrapping_add((s >> 2) as i8);
+            offset += 1;
         }
 
         voice.ptr_offset = ptr;
@@ -237,8 +466,34 @@ impl AccuracySynth {
         let r0 = voice.loop_len;
         let vol = voice.volume as i32;
         let pcm_len = pcm_bytes.len();
+        let out_len = out.len();
+        let mut offset = 0usize;
 
-        for dst in out.iter_mut() {
+        while offset < out_len {
+            if step > 0
+                && (step as i32) > 0
+                && (phase as i32) >= 0
+                && (sl as i32) > 0
+                && ptr < pcm_len
+            {
+                let safe_pcm = ((pcm_len - ptr) as u64).saturating_mul(0x1000);
+                let limit_phase = (sl as u64).min(safe_pcm);
+                if (phase as u64) < limit_phase {
+                    let k_max = (limit_phase - 1 - (phase as u64)) / (step as u64);
+                    let run = ((k_max + 1) as usize).min(out_len - offset);
+                    mix_pcm_interior_run::<false>(
+                        &pcm_bytes[ptr..pcm_len],
+                        &mut out[offset..offset + run],
+                        phase,
+                        step,
+                        vol,
+                    );
+                    phase = phase.wrapping_add(step.wrapping_mul(run as u32));
+                    offset += run;
+                    continue;
+                }
+            }
+
             if (phase as i32) >= (sl as i32) {
                 ptr = ptr.wrapping_add(ip as usize);
                 ip = 0;
@@ -258,7 +513,8 @@ impl AccuracySynth {
             }
             let s = pcm_bytes[idx] as i8 as i32;
             let scaled = s.wrapping_mul(vol) >> 8;
-            *dst = dst.wrapping_add(scaled as i8);
+            out[offset] = out[offset].wrapping_add(scaled as i8);
+            offset += 1;
         }
 
         voice.ptr_offset = ptr;
@@ -310,7 +566,6 @@ impl AccuracySynth {
         let vol = voice.volume as i32;
         let mut pred = voice.predictor;
         let mut step_idx = voice.step_index.clamp(0, 88);
-        let mut step = IMA_STEP_TABLE[step_idx as usize];
         let mut byte_off = voice.byte_offset;
         let mut toggle = voice.nibble_toggle;
         let mut cached = voice.cached_byte;
@@ -319,6 +574,77 @@ impl AccuracySynth {
         let out_len = out.len();
         let data_len = adpcm_bytes.len();
 
+        // If starting on the low nibble, consume 1 nibble first to align `toggle == 0`.
+        if toggle != 0 && out_idx < out_len {
+            let nib = cached & 0x0F;
+            toggle = !toggle;
+
+            pred = pred.wrapping_add(IMA_SIGNED_DIFF_LUT[step_idx as usize][nib as usize]);
+            step_idx = (step_idx + ima_index_delta(nib)).clamp(0, 88);
+            let scaled = ((pred.wrapping_mul(vol) as u32) >> 16) as i8;
+
+            out[out_idx] = out[out_idx].wrapping_add(scaled);
+            out_idx += 1;
+            if out_idx < out_len {
+                out[out_idx] = out[out_idx].wrapping_add(scaled);
+                out_idx += 1;
+                if out_idx < out_len {
+                    rem = rem.wrapping_sub(1);
+                    if rem == 0 {
+                        voice.active = false;
+                        voice.remaining_nibbles = rem;
+                        voice.predictor = pred;
+                        voice.step_index = step_idx;
+                        voice.byte_offset = byte_off;
+                        voice.nibble_toggle = toggle;
+                        voice.cached_byte = cached;
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fast interior byte-pair path: decodes 2 nibbles -> 4 output samples per byte with
+        // register-arithmetic step_idx updates (breaking L1 load-to-use latency) and
+        // zero per-nibble toggle/bounds/termination branches.
+        if toggle == 0 && out_idx + 4 < out_len && byte_off < data_len && rem > 2 {
+            let avail_bytes = data_len - byte_off;
+            let avail_out_bytes = (out_len - out_idx - 1) / 4;
+            let avail_rem_bytes = ((rem - 1) / 2) as usize;
+            let fast_bytes = avail_bytes.min(avail_out_bytes).min(avail_rem_bytes);
+
+            if fast_bytes > 0 {
+                let src = &adpcm_bytes[byte_off..byte_off + fast_bytes];
+                let dst = &mut out[out_idx..out_idx + fast_bytes * 4];
+                let mut last_byte = cached;
+                let (dst_chunks, _) = dst.as_chunks_mut::<4>();
+                for (&byte, chunk) in src.iter().zip(dst_chunks) {
+                    last_byte = byte;
+
+                    // High nibble -> samples 0 & 1
+                    let hi = (byte >> 4) & 0x0F;
+                    pred = pred.wrapping_add(IMA_SIGNED_DIFF_LUT[step_idx as usize][hi as usize]);
+                    step_idx = (step_idx + ima_index_delta(hi)).clamp(0, 88);
+                    let s_hi = ((pred.wrapping_mul(vol) as u32) >> 16) as i8;
+                    chunk[0] = chunk[0].wrapping_add(s_hi);
+                    chunk[1] = chunk[1].wrapping_add(s_hi);
+
+                    // Low nibble -> samples 2 & 3
+                    let lo = byte & 0x0F;
+                    pred = pred.wrapping_add(IMA_SIGNED_DIFF_LUT[step_idx as usize][lo as usize]);
+                    step_idx = (step_idx + ima_index_delta(lo)).clamp(0, 88);
+                    let s_lo = ((pred.wrapping_mul(vol) as u32) >> 16) as i8;
+                    chunk[2] = chunk[2].wrapping_add(s_lo);
+                    chunk[3] = chunk[3].wrapping_add(s_lo);
+                }
+                cached = last_byte;
+                byte_off += fast_bytes;
+                out_idx += fast_bytes * 4;
+                rem = rem.wrapping_sub((fast_bytes as u32) * 2);
+            }
+        }
+
+        // Exact scalar tail (handles remaining 1..=4 samples, EOF, odd lengths, and rem == 0).
         while out_idx < out_len {
             let nib = if toggle == 0 {
                 if byte_off >= data_len {
@@ -333,14 +659,8 @@ impl AccuracySynth {
             };
             toggle = !toggle;
 
-            step_idx = (step_idx + IMA_INDEX_TABLE[nib as usize]).clamp(0, 88);
-            let diff = ((((nib & 7) as i32).wrapping_mul(step)) as u32 >> 2) as i32;
-            if (nib & 8) != 0 {
-                pred = pred.wrapping_sub(diff);
-            } else {
-                pred = pred.wrapping_add(diff);
-            }
-            step = IMA_STEP_TABLE[step_idx as usize];
+            pred = pred.wrapping_add(IMA_SIGNED_DIFF_LUT[step_idx as usize][nib as usize]);
+            step_idx = (step_idx + ima_index_delta(nib)).clamp(0, 88);
 
             let scaled = ((pred.wrapping_mul(vol) as u32) >> 16) as i8;
 
@@ -483,7 +803,7 @@ fn sin_f64(x: f64) -> f64 {
 
 /// High-fidelity 48,000 Hz `f32` software synthesizer with band-limited Lanczos-3 polyphase
 /// windowed-sinc interpolation (and general Lanczos-`a` fallback) plus equal-power stereo panning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StudioSynth {
     /// Output sample rate in Hz (default [`Self::SAMPLE_RATE`] = `48_000`).
     pub sample_rate: u32,
@@ -545,93 +865,197 @@ impl StudioSynth {
         let pcm_len = pcm.len();
         let step = freq_hz / (self.sample_rate as f64);
 
+        let gain = (volume.clamp(0.0, 1.0) as f64) * (1.0 / 128.0);
         let pan_clamped = pan.clamp(-1.0, 1.0) as f64;
         let angle = (pan_clamped + 1.0) * core::f64::consts::FRAC_PI_4;
-        let gain_l = (cos_f64(angle) as f32) * volume * (1.0 / 128.0);
-        let gain_r = (sin_f64(angle) as f32) * volume * (1.0 / 128.0);
+        let gain_l = (gain * cos_f64(angle)) as f32;
+        let gain_r = (gain * sin_f64(angle)) as f32;
 
         let loop_bounds = sample.loop_start.zip(sample.loop_end).and_then(|(ls, le)| {
             let ls = ls as usize;
             let le = (le as usize).min(pcm_len);
             if le > ls { Some((ls, le)) } else { None }
         });
-
-        let lobes = self.sinc_lobes.max(1);
-        let mut pos = *pos_f64;
-
-        let fetch = |idx: isize| -> f32 {
-            if let Some((ls, le)) = loop_bounds {
-                let loop_len = (le - ls) as isize;
-                let wrapped = if idx < 0 {
-                    0usize
-                } else if idx >= le as isize {
-                    let over = (idx - ls as isize).rem_euclid(loop_len);
-                    ls + (over as usize)
-                } else {
-                    idx as usize
-                };
-                (pcm[wrapped] as i8) as f32
-            } else if idx < 0 || idx >= pcm_len as isize {
-                0.0
-            } else {
-                (pcm[idx as usize] as i8) as f32
-            }
+        let (looped, loop_start, effective_end) = match loop_bounds {
+            Some((ls, le)) => (true, ls, le),
+            None => (false, 0, pcm_len),
         };
+        let loop_len = if looped { effective_end - loop_start } else { 0 };
+        let loop_start_f = loop_start as f64;
+        let loop_len_f = loop_len as f64;
+        let effective_end_f = effective_end as f64;
 
-        for i in 0..frames {
-            if let Some((ls, le)) = loop_bounds {
-                let le_f = le as f64;
-                let loop_len_f = (le - ls) as f64;
-                if pos >= le_f {
-                    pos = (ls as f64) + ((pos - (ls as f64)) % loop_len_f);
+        let out_l = &mut out_left[..frames];
+        let out_r = &mut out_right[..frames];
+
+        if self.sinc_lobes == 3 {
+            let safe_max_base = effective_end.saturating_sub(4);
+            let mut ph = *pos_f64;
+            let mut idx = 0usize;
+
+            while idx < frames {
+                if ph >= effective_end_f {
+                    if looped {
+                        ph -= loop_len_f;
+                        if ph >= effective_end_f {
+                            ph = loop_start_f + ((ph - loop_start_f) % loop_len_f);
+                        }
+                        if ph < loop_start_f {
+                            ph = loop_start_f;
+                        }
+                    } else {
+                        break;
+                    }
                 }
-            } else if pos >= pcm_len as f64 {
-                break;
+
+                let base = ph as usize;
+                if effective_end >= 6
+                    && base >= 2
+                    && base <= safe_max_base
+                    && step < (1u64 << 31) as f64
+                {
+                    let safe_limit = (safe_max_base as f64) + 0.999_999;
+                    let max_interior = (((safe_limit - ph) / step) as usize) + 1;
+                    let run = max_interior.min(frames - idx);
+                    if run >= 4 {
+                        const Q32_SCALE: f64 = 4_294_967_296.0;
+                        let ph_q32 = (ph * Q32_SCALE) as u64;
+                        let step_q32 = (step * Q32_SCALE) as u64;
+                        let last_base = ((ph_q32
+                            .saturating_add(step_q32.saturating_mul((run - 1) as u64)))
+                            >> 32) as usize;
+                        if last_base <= safe_max_base {
+                            let src = &pcm[..last_base + 4];
+                            let mut ph_shifted = ph_q32 - (2u64 << 32);
+                            for (ol, or) in out_l[idx..idx + run]
+                                .iter_mut()
+                                .zip(&mut out_r[idx..idx + run])
+                            {
+                                let b0 = (ph_shifted >> 32) as usize;
+                                // Nearest 1024-phase index in `0..=1024`
+                                let p = (((ph_shifted & 0xFFFF_FFFF) + (1 << 21)) >> 22) as usize;
+                                let w = &LANCZOS3_LUT[p];
+                                let win = &src[b0..b0 + 6];
+                                let s0 = (win[0] as i8) as f32;
+                                let s1 = (win[1] as i8) as f32;
+                                let s2 = (win[2] as i8) as f32;
+                                let s3 = (win[3] as i8) as f32;
+                                let s4 = (win[4] as i8) as f32;
+                                let s5 = (win[5] as i8) as f32;
+                                // Balanced reduction tree halves FMA dependency chain latency
+                                let val = (s0 * w[0] + s1 * w[1])
+                                    + (s2 * w[2] + s3 * w[3])
+                                    + (s4 * w[4] + s5 * w[5]);
+                                *ol += val * gain_l;
+                                *or += val * gain_r;
+                                ph_shifted += step_q32;
+                            }
+                            ph += (run as f64) * step;
+                            idx += run;
+                            continue;
+                        }
+                    }
+                }
+
+                // Boundary / loop-edge single-sample step
+                let frac = ph - (base as f64);
+                let p = ((frac * (LANCZOS_PHASES as f64) + 0.5) as usize).min(LANCZOS_PHASES);
+                let w = &LANCZOS3_LUT[p];
+
+                let mut s = [0.0f32; 6];
+                let base_i = base as isize;
+                for (slot, k) in s.iter_mut().zip(-2isize..=3) {
+                    let sample_idx = base_i + k;
+                    if sample_idx < 0 {
+                        if looped {
+                            *slot = (pcm[0] as i8) as f32;
+                        }
+                    } else {
+                        let u = sample_idx as usize;
+                        if u < effective_end {
+                            *slot = (pcm[u] as i8) as f32;
+                        } else if looped {
+                            let wrapped = loop_start + ((u - loop_start) % loop_len);
+                            *slot = (pcm[wrapped] as i8) as f32;
+                        }
+                    }
+                }
+
+                let val = (s[0] * w[0] + s[1] * w[1])
+                    + (s[2] * w[2] + s[3] * w[3])
+                    + (s[4] * w[4] + s[5] * w[5]);
+
+                out_l[idx] += val * gain_l;
+                out_r[idx] += val * gain_r;
+                ph += step;
+                idx += 1;
             }
 
-            let base = pos as isize;
-            let frac = pos - (base as f64);
-
-            let interpolated = if lobes == 3 {
-                let p_idx = ((frac * (LANCZOS_PHASES as f64) + 0.5) as usize).min(LANCZOS_PHASES);
-                let w = &LANCZOS3_LUT[p_idx];
-                w[0] * fetch(base - 2)
-                    + w[1] * fetch(base - 1)
-                    + w[2] * fetch(base)
-                    + w[3] * fetch(base + 1)
-                    + w[4] * fetch(base + 2)
-                    + w[5] * fetch(base + 3)
-            } else {
-                let a = lobes as isize;
-                let a_f = lobes as f64;
-                let mut acc = 0.0f64;
-                let mut wsum = 0.0f64;
-                let mut k = 1 - a;
-                while k <= a {
-                    let w = lanczos_kernel(frac - (k as f64), a_f);
-                    acc += w * (fetch(base + k) as f64);
-                    wsum += w;
-                    k += 1;
-                }
-                if wsum > 1e-12 {
-                    (acc / wsum) as f32
-                } else {
-                    0.0
-                }
-            };
-
-            out_left[i] += interpolated * gain_l;
-            out_right[i] += interpolated * gain_r;
-            pos += step;
+            *pos_f64 = ph;
+            return;
         }
 
-        *pos_f64 = pos;
+        // General fallback for custom `sinc_lobes != 3`
+        let a = self.sinc_lobes.max(1) as isize;
+        let a_f = a as f64;
+        let mut ph = *pos_f64;
+
+        for (ol, or) in out_l.iter_mut().zip(out_r.iter_mut()) {
+            if ph >= effective_end_f {
+                if looped {
+                    ph = loop_start_f + ((ph - loop_start_f) % loop_len_f);
+                } else {
+                    break;
+                }
+            }
+            let base = ph as isize;
+            let frac = ph - (base as f64);
+            let mut acc = 0.0f64;
+            let mut wsum = 0.0f64;
+            let mut k = 1 - a;
+            while k <= a {
+                let sample_idx = base + k;
+                let s_val = if sample_idx < 0 {
+                    if looped {
+                        (pcm[0] as i8) as f64
+                    } else {
+                        0.0
+                    }
+                } else {
+                    let u = sample_idx as usize;
+                    if u < effective_end {
+                        (pcm[u] as i8) as f64
+                    } else if looped {
+                        let wrapped = loop_start + ((u - loop_start) % loop_len);
+                        (pcm[wrapped] as i8) as f64
+                    } else {
+                        0.0
+                    }
+                };
+                let w = lanczos_kernel(frac - (k as f64), a_f);
+                acc += w * s_val;
+                wsum += w;
+                k += 1;
+            }
+            let interpolated = if wsum > 1e-12 {
+                (acc / wsum) as f32
+            } else {
+                0.0
+            };
+
+            *ol += interpolated * gain_l;
+            *or += interpolated * gain_r;
+            ph += step;
+        }
+
+        *pos_f64 = ph;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::freq::IMA_INDEX_TABLE;
 
     #[test]
     fn test_studio_synth_equal_power_panning_and_fallback() {
@@ -657,5 +1081,55 @@ mod tests {
         studio4.render_voice_f32(&view, &mut pos4, 10_512.0, 1.0, -1.0, &mut l4, &mut r4);
         assert!(l4[16] > 0.4);
         assert!(r4[16].abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_ima_signed_diff_lut_matches_arm_formula() {
+        for idx in 0..89usize {
+            let step = IMA_STEP_TABLE[idx];
+            for nib in 0..16usize {
+                let expected_delta = {
+                    let diff = ((((nib & 7) as i32) * step) as u32 >> 2) as i32;
+                    if (nib & 8) != 0 { -diff } else { diff }
+                };
+                assert_eq!(IMA_SIGNED_DIFF_LUT[idx][nib], expected_delta);
+                assert_eq!(ima_index_delta(nib as u8), IMA_INDEX_TABLE[nib]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_studio_synth_lut_matches_direct_lanczos3() {
+        let pcm: [u8; 64] = core::array::from_fn(|i| {
+            let angle = (i as f64) * 0.35;
+            (sin_const(angle) * 100.0) as i8 as u8
+        });
+        let view = LogikSampleView::from_pcm_bytes(10_512, 64, None, None, &pcm);
+        let synth = StudioSynth::new(48_000);
+        let mut left = [0.0f32; 128];
+        let mut right = [0.0f32; 128];
+        let mut pos = 5.25;
+        synth.render_voice_f32(&view, &mut pos, 12_000.0, 1.0, 0.0, &mut left, &mut right);
+
+        let step = 12_000.0 / 48_000.0;
+        let gain_l = ((1.0 / 128.0) * cos_f64(core::f64::consts::FRAC_PI_4)) as f32;
+        let mut ref_pos = 5.25f64;
+        for &actual in &left {
+            let center = ref_pos as isize;
+            let mut acc = 0.0f64;
+            let mut wsum = 0.0f64;
+            for k in (center - 2)..=(center + 3) {
+                let s = (pcm[k as usize] as i8) as f64;
+                let w = lanczos_kernel(ref_pos - (k as f64), 3.0);
+                acc += s * w;
+                wsum += w;
+            }
+            let expected = ((acc / wsum) as f32) * gain_l;
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "LUT mismatch: actual={actual}, expected={expected}"
+            );
+            ref_pos += step;
+        }
     }
 }

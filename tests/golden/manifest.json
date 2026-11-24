@@ -1,0 +1,97 @@
+{
+  "engine": "Logik State GBAModPlay",
+  "harness": "libmgba.so.0.10",
+  "total_bytes": 1856,
+  "vectors": [
+    {
+      "name": "v1_mod1_resampled_loop",
+      "bytes": 128,
+      "nonzero": 124,
+      "sha256": "25399a8264c820d75e1c88e43226977d674d1824d42b82beb70f50574ba6f708"
+    },
+    {
+      "name": "v1_mod1_2voice_wrap",
+      "bytes": 128,
+      "nonzero": 124,
+      "sha256": "4bfa3556e91bfb7bae8ab63f48e330e542ce886aac464f7af2368bd10c139724"
+    },
+    {
+      "name": "v2_halfword_general_loop",
+      "bytes": 128,
+      "nonzero": 127,
+      "sha256": "a6280b364ad7089cf8410b5f69d2b2bcdcc305b751ce24462f81df955597b621"
+    },
+    {
+      "name": "v2_halfword_vol64_fast",
+      "bytes": 128,
+      "nonzero": 128,
+      "sha256": "cd81cc058f35142ab2c02d089be090055a246e44194c8f959ee0652e21fe30b7"
+    },
+    {
+      "name": "v2_halfword_len2_guard",
+      "bytes": 64,
+      "nonzero": 0,
+      "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"
+    },
+    {
+      "name": "v2_word_general_loop",
+      "bytes": 128,
+      "nonzero": 122,
+      "sha256": "483ef70a0020124641a70cce4f8a82e80359a676f461ea62713b55a18883559b"
+    },
+    {
+      "name": "v2_word_vol64_fast",
+      "bytes": 128,
+      "nonzero": 128,
+      "sha256": "6226095447b8ee8326212a2464da31f24fe365637b748071c5cd89a109439e57"
+    },
+    {
+      "name": "v3_early_general_loop",
+      "bytes": 128,
+      "nonzero": 123,
+      "sha256": "108531d48fca4dd12b5b072726dfdc0ae8cd72d39f85d362c6128671c2362b53"
+    },
+    {
+      "name": "v3_early_oneshot",
+      "bytes": 128,
+      "nonzero": 51,
+      "sha256": "6b393f2a3b80e101934d21d1b0ff5c412a73216adc3de9198d171eb552663be9"
+    },
+    {
+      "name": "v3_early_vol64_quirk",
+      "bytes": 128,
+      "nonzero": 128,
+      "sha256": "337d1cbaeb73b4295c0536aca67f2b35c0d3d19820044deaf6f3c5ff37c17b38"
+    },
+    {
+      "name": "v3_adpcm_single_voice",
+      "bytes": 128,
+      "nonzero": 94,
+      "sha256": "315bcfc93d217681e70c146e5954b2f2fa4fa37515a9bcd10eee495f2fca8701"
+    },
+    {
+      "name": "v3_adpcm_2voice_mix",
+      "bytes": 128,
+      "nonzero": 125,
+      "sha256": "cb7e883736dc403b9943a8daa505e0afd690a6059b2303337385abc2089dd9b8"
+    },
+    {
+      "name": "v3_adpcm_odd_resume",
+      "bytes": 128,
+      "nonzero": 94,
+      "sha256": "e15a338b0e2098426fb8a5d1e6de0f41968da3ad275c600cd99c50892473c66a"
+    },
+    {
+      "name": "v3_standard_resampled_loop",
+      "bytes": 128,
+      "nonzero": 128,
+      "sha256": "4b6fbe0c547a7a45aaaf167cad73ddabe1ffbc98d841ed79d3f5e8ba4b7b366a"
+    },
+    {
+      "name": "v3_standard_2voice_wrap",
+      "bytes": 128,
+      "nonzero": 126,
+      "sha256": "3396627a99e380e9f956b66e55fe9e6de0da8444493f6099bd86ed913d60058b"
+    }
+  ]
+}

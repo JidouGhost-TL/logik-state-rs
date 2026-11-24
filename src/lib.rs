@@ -22,6 +22,23 @@
 //!     with equal-power stereo panning.
 //! - **Byte-exact `libmgba` ARM golden tested**: 1,856 / 1,856 output bytes verified strictly
 //!   byte-for-byte (`assert_eq!`, zero tolerance) across all 6 engine revisions.
+//!
+//! ## Quickstart
+//!
+//! ```rust
+//! use logik_state::{AccuracySynth, LogikPcmVoice, LogikVersion};
+//!
+//! // Raw signed 8-bit PCM waveform
+//! let pcm: &[u8] = &[0, 32, 64, 96, 127, 96, 64, 32, 0, 224, 192, 160, 128, 160, 192, 224];
+//!
+//! // V3Standard Q20.12 looped voice, 1.0x pitch (0x1000), volume 64
+//! let mut voice = LogikPcmVoice::new_v3(0, 0, 0x1000, pcm.len() as u32, 0, pcm.len() as u32, 64);
+//! let mut out = [0i8; 128];
+//!
+//! AccuracySynth::mix_pcm_voice(LogikVersion::V3Standard, pcm, &mut voice, &mut out);
+//! assert_eq!(out[0], 0);
+//! assert_eq!(out[4], 31);
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]

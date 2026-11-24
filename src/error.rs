@@ -3,7 +3,7 @@
 use core::fmt;
 
 /// Errors returned when parsing Logik State GBAModPlay modules, sample banks, or audio streams.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Error {
     /// Input buffer ended before a complete header, descriptor, or payload could be read.

@@ -162,7 +162,7 @@ fn mix_pcm_interior_run<const VOL64: bool>(
 ///
 /// Every mixing kernel in `AccuracySynth` is verified strictly byte-for-byte (`assert_eq!`,
 /// zero tolerance) against real ARM7TDMI execution captured in headless `libmgba.so.0.10`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct AccuracySynth;
 
 impl AccuracySynth {
@@ -854,6 +854,7 @@ impl StudioSynth {
             || !freq_hz.is_finite()
             || freq_hz <= 0.0
             || !pos_f64.is_finite()
+            || !volume.is_finite()
         {
             return;
         }
@@ -866,7 +867,11 @@ impl StudioSynth {
         let step = freq_hz / (self.sample_rate as f64);
 
         let gain = (volume.clamp(0.0, 1.0) as f64) * (1.0 / 128.0);
-        let pan_clamped = pan.clamp(-1.0, 1.0) as f64;
+        let pan_clamped = if pan.is_finite() {
+            pan.clamp(-1.0, 1.0) as f64
+        } else {
+            0.0
+        };
         let angle = (pan_clamped + 1.0) * core::f64::consts::FRAC_PI_4;
         let gain_l = (gain * cos_f64(angle)) as f32;
         let gain_r = (gain * sin_f64(angle)) as f32;

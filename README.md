@@ -28,7 +28,7 @@
 
 ## Supported Logik State GBAModPlay Revisions
 
-Auditing all 3,374 GBA ROMs identifies **6 distinct ARM7TDMI mixer revisions** spanning **60 commercial titles**, all detected via [`LogikVersion::detect_from_bytes`] and byte-exact golden-tested:
+Auditing all 3,374 GBA ROMs identifies **6 distinct ARM7TDMI mixer revisions** spanning **60 commercial titles**, all detected via `LogikVersion::detect_from_bytes` and byte-exact golden-tested:
 
 | Revision | Corpus Share | Representative Titles | Song Magic | Mixer ARM7TDMI Details | IMA ADPCM |
 | --- | ---: | --- | --- | --- | --- |
@@ -71,6 +71,21 @@ Every mixing path in `AccuracySynth` is verified strictly byte-for-byte (`assert
   - `V3EarlyVol64` (3 vectors, 384 bytes): Q20.12 general loop, one-shot early stop, and `vol == 64` post-loop stale-`r6` quirk.
   - `V3EarlyVol64Adpcm` (3 vectors, 384 bytes): single 4-bit IMA ADPCM voice, PCM8 + ADPCM 2-voice mix, and odd-count (`63 + 65`) ADPCM resume.
   - `V3Standard` (2 vectors, 256 bytes): Q20.12 looped `vol == 64` (no quirk) + 2-voice looped/one-shot wrapping sum.
+
+---
+
+## Benchmarks
+
+```sh
+cargo bench --bench bench_audio
+```
+
+| Benchmark | Throughput |
+| --- | ---: |
+| `AccuracySynth::mix_v3_standard` (128f) | ~2.25 GSamples/s |
+| `AccuracySynth::mix_v2_halfword` (`vol == 64`, 128f) | ~3.45 GSamples/s |
+| `AccuracySynth::mix_v3_adpcm_voice` (2x IMA ADPCM, 128f) | ~1.13 GSamples/s |
+| `StudioSynth::render_voice_f32` (48 kHz Lanczos-3, 1,024f) | ~396.8 MSamples/s |
 
 ---
 

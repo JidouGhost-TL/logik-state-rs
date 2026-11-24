@@ -130,9 +130,13 @@ impl LogikSampleDescV2 {
     #[inline]
     #[must_use]
     pub const fn is_looped(&self) -> bool {
-        !self.is_ima_adpcm()
-            && self.loop_len > 2
-            && self.loop_start.saturating_add(self.loop_len) <= self.length
+        if self.is_ima_adpcm() || self.loop_len <= 2 {
+            return false;
+        }
+        match self.loop_start.checked_add(self.loop_len) {
+            Some(end) => end <= self.length,
+            None => false,
+        }
     }
 }
 
@@ -180,7 +184,13 @@ impl LogikSampleDescV3 {
     #[inline]
     #[must_use]
     pub const fn is_looped(&self) -> bool {
-        self.loop_len > 2 && self.loop_start.saturating_add(self.loop_len) <= self.length
+        if self.loop_len <= 2 {
+            return false;
+        }
+        match self.loop_start.checked_add(self.loop_len) {
+            Some(end) => end <= self.length,
+            None => false,
+        }
     }
 }
 
